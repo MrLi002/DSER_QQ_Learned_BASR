@@ -1,0 +1,1210 @@
+--- a/MODIFICATION_GUIDE.md
++++ b/MODIFICATION_GUIDE.md
+@@ -1,195 +1,236 @@
+-# DSER++：学习支持来源的选择性修复
+-
+-本代码是基于 `MrLi002/DSER-QQ` 的实验性改进，基准提交为
+-`983d929512d5af48c12960333438546e04a6daaa`。它实现本次讨论的三个部分：
+-
+-1. 从粗插帧预测重建难度，按每张图像的 top-k patch 选择修复区域。
+-2. 从 E-PCD 的两端采样位置检索支持，学习左端、右端、保留当前结果三种来源的权重。
+-3. 把左右事件片段的活动量与归一化时间统计作为来源判断和门控的辅助输入。
+-
+-这是待实验验证的新方法实现，没有经过 BS-ERGB 完整训练，不能据此宣称指标提高。
+-
+-## 一、需要替换或新增的文件
+-
+-| 文件 | 操作 | 具体修改 |
++# DSER++ Learned BASR V2：完整修订代码
++
++本版基于 `MrLi002/DSER-QQ` 的提交 `983d929512d5af48c12960333438546e04a6daaa`，
++修正上一版 Learned BASR 的粗对齐证据、直接检索监督和来源判断输入问题。
++压缩包提供完整文本源码，不包含数据、模型权重或演示图片。
++这是功能验证后的研究实现，尚未完成真实数据完整训练，不能宣称指标提升。
++
++## 1. 本次修正
++
++| 项目 | V1 | V2 |
+ |---|---|---|
+-| `model/selective_basr.py` | 新增 | 难度头、top-k 选择、目标坐标检索、来源融合、门控写回及辅助损失 |
+-| `model/blocks.py` | 修改 | `FeaTNet.forward(..., return_alignment=False)` 可额外返回各尺度的 E-PCD offset；原计算与权重不变 |
+-| `model/ourNet.py` | 修改 | 串联难度预测、选区、事件统计、双向采样信息；保留原模式 |
+-| `model/trans_sys.py` | 修改 | 两处 `DetailsSup` 可切换为 `LearnedDetailsSup`；传递训练辅助输出 |
+-| `model/checkpoints.py` | 新增 | 统一键名、旧权重迁移、推理配置恢复与续训配置检查 |
+-| `train_bsergb.py` | 修改 | 新增配置、三项辅助损失、日志及旧权重微调支持 |
+-| `model/ourModel.py` | 修改 | 统一权重加载；推理时把 padding 排除在选区和支持检索之外 |
+-| `interpolation.py` | 修改 | 自动识别 checkpoint 的 BASR 模式和参数；补齐其他评测分支的 data_root 参数 |
+-
+-`model/patch_attention.py` 保留原样，供 `--basr-mode original` 使用。
+-`model/loss.py` 的原损失保持不变；新增辅助损失位于 `model/selective_basr.py`。
+-数据读取、事件掩码生成规则和前两阶段主体都沿用基准版本。本次不同时修改此前讨论的论文/公开实现参数差异。
+-
+-可以把上述八个程序文件按相同相对路径覆盖到原项目。压缩包同时包含完整文本源码和 `changes.patch`，可以直接使用整个目录。
+-
+-## 二、主要计算
+-
+-### 1. 难度预测与选区
+-
+-`DifficultyHead` 接收两张端点图像、停止梯度的粗插帧 `Ft.detach()` 和事件时间统计。
+-它输出 `[B,1,H,W]` 的难度图 `difficulty`。训练目标是：
+-
+-```python
+-error_target = (coarse.detach() - gt).abs().mean(dim=1, keepdim=True)
+-```
+-
+-使用像素 Smooth L1 和 patch 平均误差 L1 监督。困难区域按预测难度排名，不把 GT 误差图送入 forward 或 top-k。
+-
+-默认原图 patch 大小 32、比例 0.25。对每张图像独立选取 `ceil(0.25 * 有效patch数)` 个 patch。
+-`--repair-ratio 0` 关闭局部修复，`1` 对所有有效 patch 开放局部修复。
+-固定 top-k 预算不代表每张图都存在错误；最后是否修改仍由来源权重和门控决定。
+-
+-### 2. 目标坐标下检索支持
+-
+-阶段 B 额外返回 `[off_half, off_quarter, off_eighth]`，不改变其原有输出或参数。
+-第三阶段的两个 BASR 分别使用 quarter 和 half 的采样位置。
+-
+-对于目标位置 x，第 k 个候选源位置为：
++| 残差偏移输入 | target、同坐标 source、事件统计 | target、E-PCD 候选采样聚合后的 source、事件统计、采样有效性 |
++| 检索器训练 | 主损失及来源/门控损失的间接梯度 | 另加不受门控和来源权重抑制的检索 RGB 损失 |
++| 来源判断输入 | 潜在特征及未经校准的特征差等 | 加入两端检索 RGB、当前尺度 RGB 预测及两组 RGB 差，去掉未经校准的潜在特征绝对差 |
++| DCN 调制量 | 未使用 | 对 detach 的原始调制量做可学习映射，转为归一化弱先验 |
++| 监控 | 损失 | 另记录来源使用量、门控、有效使用量、有效支持比例与 RGB 误差；保存 CSV |
++| V1 权重兼容 | 无版本区分 | 只能通过 --pretrained 迁移，禁止把 V1 当 V2 直接推理或续训 |
++
++第一阶段、第二阶段的原计算保持不变。第二阶段只通过可选返回值暴露 offset 和 modulation。
++本次没有同时修改事件掩码、数据读取、原评测步长或其他论文与公开实现的差异。
++
++## 2. 文件对应
++
++| 文件 | 作用 |
++|---|---|
++| model/selective_basr.py | 两阶段采样、难度/top-k、RGB 证据、融合门控、直接检索损失和监控量 |
++| model/blocks.py | FeaTNet 可选返回各尺度 offset 和 modulation |
++| model/ourNet.py | 串联新增模块；保留 original 与 learned 模式 |
++| model/trans_sys.py | 给两处 BASR 传递对应尺度的采样和调制信息 |
++| model/checkpoints.py | 原版/V1/V2 识别、迁移、严格主干检查及推理参数恢复 |
++| train_bsergb.py | 新增损失、日志、CSV 与训练配置 |
++| model/ourModel.py | 权重加载；推理时排除 padding |
++| interpolation.py | 按 checkpoint 恢复结构参数并评测 |
++
++`model/patch_attention.py` 保留原 BASR。
++`model/loss.py` 保留原损失，新增损失集中在 `selective_basr.py`。
++V2 相对 V1 的逐行修改见 `changes_from_v1.patch`；相对原仓库的修改见 `changes_from_original.patch`。
++
++## 3. 关键机制
++
++### 3.1 难度预测与选区
++
++难度头输入端点图像、`Ft.detach()` 和左右事件统计，预测 `[B,1,H,W]` 的误差图。
++训练目标为 `mean_c(abs(Ft.detach() - GT))`，使用像素 Smooth L1 和 patch 平均误差 L1 监督。
++GT 只参与损失，不进入网络 forward 或 top-k。默认每张图独立选取难度最高的 25% patch，patch 为 32。
++`--repair-ratio 0` 关闭局部修复，`1` 让所有有效 patch 参与检索。
++固定预算不意味着每张图都有同样多错误，是否使用外部支持仍由门控与来源权重决定。
++
++### 3.2 先粗采样，再预测残差
++
++E-PCD 返回：
++
++```python
++return out, {
++    'offsets': [off_half, off_quarter, off_eighth],
++    'modulation': [m_half, m_quarter, m_eighth],
++}
++```
++
++第三阶段两处 BASR 分别使用 quarter、half 尺度的候选。
++每个候选位置按 torchvision DCN 的 `(dy, dx)` 通道顺序计算：
+ 
+ ```text
+-source_position = target_position + kernel_position[k]
+-                  + epcd_offset[k] + learned_residual[k]
+-```
+-
+-保留九个候选点，按 torchvision 的 `(dy, dx)` 顺序解释 18 个 offset 通道。
+-不把 offset 平均成二维光流。源坐标与对应尺度的关键帧特征使用同一网格。
+-新增残差由小网络预测，并经 tanh 限幅，默认不超过 2 个该尺度特征像素。
+-
+-检索以目标特征为 Q，对源特征候选进行相似度计算，softmax 加权得到目标网格的支持特征。
+-两端共享检索参数；无效、越界或位于 padding 的候选被排除。
+-候选全部无效时返回零支持和无效标志，不对全无效候选进行普通 softmax。
+-只对选区内查询执行 grid_sample，按 `--repair-chunk-size` 分块，默认 1024 个目标位置一块。
+-复杂度仍随选区像素数增加；小块可以降低采样张量峰值，但可能增加调用开销。
+-
+-E-PCD offset 在此分支中 detach，新增检索不会通过采样中心修改阶段 B；阶段 B 仍通过原损失正常训练。
+-如果原 E-PCD 采样完全偏离且超出残差范围，本模块可能找不到支持，此时使用保留分支。
+-
+-### 3. 事件时间线索
+-
+-左右片段分别提取三个量：log 活动量、加权平均 bin 时间、时间方差，再加入左右活动平衡，共七通道。
+-七通道输入用于难度头、候选微调和来源/门控判断；来源判断还使用检索支持、匹配分数及有效性。
+-
+-这些是 `abs(voxel)` 的统计代理，不是真实事件计数，也不是遮挡标签。
+-体素中存在极性抵消，且左右片段分别归一化时间，因此活动差也不能直接当成物理事件率或可见性。
+-本版本没有额外增加时间戳字段，不宣称恢复真实遮挡方向。
+-
+-### 4. 来源融合和选择性写回
+-
+-```python
+-weights = route_logits.softmax(dim=1)  # [w0, w1, wr]
++coarse_position = target_position + kernel_position + detached_epcd_offset
++```
++
++第一遍采样在这些位置检索 source 特征，按匹配注意力聚合，得到目标坐标网格的 `coarse_aligned`。
++残差头输入：
++
++```python
++cat(target, coarse_aligned, temporal, coarse_valid)
++```
++
++然后在 `coarse_position + bounded_residual` 上第二遍采样。
++不使用未经采样的同坐标 source 预测残差，也不把九个 offset 平均成光流。
++聚合仅统计有效候选；无效候选不会参与注意力。
++默认残差范围为该尺度的 +/-2 特征像素。若 E-PCD 候选完全偏离，局部残差不能保证找回远处支持。
++
++采样只对选区内目标位置执行，默认每块处理 1024 个位置。两遍采样会增加计算，分块不消除训练时全部反向图的存储成本。
++E-PCD offset 和 modulation 在该读取分支中 detach；这并不等于冻结整个前两阶段。
++
++### 3.3 DCN 调制量作为弱先验
++
++原代码的 m 是未经过 sigmoid 的卷积输出，可能为负，不能直接取 log 或当成可见性概率。
++V2 使用：
++
++```python
++log_prior = log_softmax(modulation_projection(m.detach()), dim=1)
++alpha = sigmoid(prior_logit)   # 初始为 0.1，可学习
++logits = cosine_similarity / temperature + alpha * log_prior
++```
++
++再施加候选有效性掩码。该先验只表示学习到的候选偏好，不是真实可见性或已校准置信度。
++`--disable-modulation-prior` 可以禁用它，评估是否有帮助。
++
++### 3.4 来源判断使用明确的 RGB 证据
++
++来源头输入包括：目标/两端支持特征、事件统计、难度、采样有效性和匹配分数，以及：
++
++```python
++color0, color1, base_rgb,
++abs(color0 - base_rgb), abs(color1 - base_rgb)
++```
++
++其中 `base_rgb` 是当前尺度 decoder 的预测，不是 GT。
++删除 V1 中的 `abs(target_feature - value(source_feature))`，避免把未经约束的潜在空间差当作误差证据。
++
++输出三个来源权重及修复门控：
++
++```python
+ support = w0 * support0 + w1 * support1 + wr * target_feature
+-delta_low = selected_low * gate.sigmoid() * (support - target_feature)
+-delta_high = project(upsample(delta_low))
+-output = base_high + selected_high * delta_high
+-```
+-
+-代码在插值和通道投影之后再次施加选区，避免局部修复模块向选区外写回。
+-无有效支持时左右权重为零、保留权重为一。投影层无 bias，因此可以保持原特征。
+-投影层初始化为零，使新模块初始执行 decoder 本身的路径；它不等于旧 BASR 的初始输出。
+-
+-这里保证的是 BASR 模块写回范围。后续全局 Transformer/卷积仍可能传播修改，不能保证最终 RGB 图像选区外逐像素完全不变。
+-
+-## 三、训练损失
+-
+-保留原先 `Lrec + Lsyn + Lref + Lps`，另增加：
+-
+-| 损失 | 默认系数 | 作用 |
++delta = selected_low * sigmoid(gate_logits) * (support - target_feature)
++output = base_high + selected_high * project(upsample(delta))
++```
++
++越界和 padding 支持被排除；两端均无有效候选时保留分支权重为 1。
++输出投影仍为零初始化，避免新局部模块一开始大幅扰动 backbone。
++直接检索损失绕开这个零投影，因此不需要等待它变为非零才开始训练匹配。
++选区外不写入局部残差，但后续全局 decoder 仍可能传播修改，最终 RGB 不保证选区外逐像素完全不变。
++
++### 3.5 直接检索光度损失
++
++新增项独立于 gate、w0/w1/wr 和 to_high：
++
++```python
++error_i = mean_c(sqrt((retrieved_rgb_i - GT)**2 + 1e-6) - 1e-3)
++loss_retrieve = mean_selected_valid(min_valid_side(error_0, error_1))
++```
++
++该分支不 detach 检索 RGB；只对选区且至少一端有效的位置计算。
++无效方向不参与 min，两端均无效的位置跳过，空区域损失为零。
++它能在初始化时给 Q/K、采样残差头、注意力温度和调制先验映射提供梯度，不依赖来源/门控头和输出投影。
++`value` 投影仍主要由特征重建与来源/门控路径学习，RGB 损失不直接训练该投影。
++
++route/gate 的标签继续在 no_grad 中构造，避免通过改变标签逃避监督。
++这些标签是 RGB 支持有用性的代理，不是真实遮挡标签。
++min 通常主要训练获胜方向；两端都不可见时也未必存在正确外观，因此本版本使用 Charbonnier 和较小权重，仍需真实数据验证。
++
++### 3.6 事件时间统计
++
++左右片段分别提取 log 活动量、加权平均 bin 时间和时间方差，再加左右活动平衡，共 7 通道。
++这些是 abs(voxel) 的代理统计：存在极性抵消，片段时间独立归一化。
++不能把它们直接当成真实事件计数、物理事件率或遮挡方向。
++
++## 4. 损失与监控
++
++总损失保留原有四项，再加：
++
++| 新增项 | 默认系数 | 作用 |
+ |---|---:|---|
+-| `difficulty` | 1.0 | 监督粗帧误差图，解决 hard top-k 不可微的问题 |
+-| `route` | 0.05 | 用检索到的两端 RGB 和当前尺度预测相对 GT 的误差，构造三来源软目标 |
+-| `gate` | 0.05 | 用最佳外部 RGB 支持相对当前预测的改善量，监督修复强度 |
+-
+-route 的软目标温度为 0.05；gate 的改善量归一化尺度为 0.02，均以 `[0,1]` 图像范围计算。
+-这些系数是起始实验配置，没有经过验证集调参。
+-来源和门控标签均停止梯度，且只在训练损失里计算。它们是支持有用性的光度代理，不能当作真实可见性标签。
+-门控与保留权重有一定参数冗余，本版本用不同的辅助目标区分其作用；应在消融中检验是否都必要。
+-
+-返回值默认仍为原来的六项。训练需要：
+-
+-```python
+-outputs = model(imgs, voxels, mask, args.bins, return_aux=True)
+-# 前六项不变，第七项为 difficulty、selected、两级 stages 等辅助信息。
+-```
+-
+-## 四、使用命令
+-
+-建议沿用已经能运行原代码的环境。新增模块只使用 PyTorch 标准算子。
+-新增 `requirements_basr.txt` 给出了较小的依赖清单；torch/torchvision 应使用彼此匹配的版本。
+-
+-### 从头训练学习版
+-
+-```bash
+-python train_bsergb.py --data-root "/home/yuaobo/桌面/ljh/dataset/3_TRAINING" --basr-mode learned --epochs 40 --lr 1e-4 --batch-size 1 --crop-size 256 --skips 1 3 --repair-ratio 0.25 --output-dir train/bsergb_learned_basr
+-```
+-
+-### 从已有 DSER++ 权重微调
+-
+-```bash
+-python train_bsergb.py --data-root "/home/yuaobo/桌面/ljh/dataset/3_TRAINING" --pretrained train/bsergb/last.pth --basr-mode learned --epochs 20 --lr 1e-5 --batch-size 1 --crop-size 256 --skips 1 3 --repair-ratio 0.25 --output-dir train/bsergb_learned_basr_finetune
+-```
+-
+-`--pretrained` 会明确跳过旧的两处 BASR，加载其余匹配权重，重新初始化难度头和新的 BASR。
+-不会把它包装成严格无差异加载；加载日志显示新增/丢弃键数量。其他 backbone 键缺失或形状不符仍报错。
+-默认无需 `--allow-partial-pretrained`。该宽松选项仍保留，但不建议用它掩盖非 BASR 不匹配。
+-
+-### 断点续训
+-
+-```bash
+-python train_bsergb.py --data-root "/home/yuaobo/桌面/ljh/dataset/3_TRAINING" --resume train/bsergb_learned_basr/last.pth --basr-mode learned --epochs 40 --batch-size 1 --crop-size 256 --skips 1 3 --repair-ratio 0.25 --output-dir train/bsergb_learned_basr
+-```
+-
+-保持原先总 epochs、数据设置和结构参数，以延续原余弦调度。原模型转新结构应使用 `--pretrained`，不能用 `--resume`。
+-
+-### 测试
+-
+-```bash
+-python interpolation.py --dataset bsergb --data_root_path "/home/yuaobo/桌面/ljh/dataset/1_TEST" --checkpoints_path train/bsergb_learned_basr/last.pth --save_root_path eval/learned_basr
+-```
+-
+-评测会从训练 checkpoint 恢复 bins、patch 大小、选区比例、消融开关和模式；纯旧权重自动识别为 original。
+-纯 `state_dict` 格式不包含实验配置。非默认参数训练后请保留完整 checkpoint，或自行给推理 args 配齐相应属性。
+-旧版评测步长、量化和指标计算沿用源码；比较实验时保持同一评测脚本。
+-
+-### 原 BASR 对照和消融
+-
+-```bash
+-# 复现当前公开实现，不加入新增模块
+-python train_bsergb.py --data-root /path/to/BSERGB/3_TRAINING --basr-mode original --output-dir train/baseline_original
+-
+-# 去除显式事件时间统计（其余事件编码与 E-PCD 仍保留）
+-python train_bsergb.py --data-root /path/to/BSERGB/3_TRAINING --disable-event-temporal --output-dir train/ablate_temporal
+-
+-# 不使用 E-PCD 候选，围绕同坐标的 3x3 基础位置检索
+-python train_bsergb.py --data-root /path/to/BSERGB/3_TRAINING --disable-alignment-candidates --output-dir train/ablate_alignment
+-
+-# 所有 patch 参与局部检索，检验按难度分配预算的作用
+-python train_bsergb.py --data-root /path/to/BSERGB/3_TRAINING --repair-ratio 1 --output-dir train/ablate_all_patches
+-```
+-
+-不使用 E-PCD 候选的消融只有局部搜索能力，不应解释为同等搜索范围下的纯可靠性比较。
+-
+-## 五、验证范围
+-
+-验证环境：Python 3.12、PyTorch 2.5.1+cpu、torchvision 0.20.1+cpu、einops 0.8.1、NumPy 1.26.4。
+-不新增仅该环境可用的语言特性，保持 Python 3.10 的语法兼容性。
++| difficulty | 1.0 | 难度图监督 |
++| route | 0.05 | 三来源软目标监督 |
++| gate | 0.05 | 支持改善程度监督 |
++| retrieve | 0.1 | 不受门控抑制的直接 RGB 检索监督 |
++
++系数为起始配置，未经过验证集调参。
++训练输出及 `output-dir/epoch_metrics.csv` 记录：
++
++| 指标 | 含义 |
++|---|---|
++| source_usage | w0+w1 的平均值 |
++| gate_mean | sigmoid(gate_logits) 的平均值 |
++| effective_usage | gate*(w0+w1) 的平均值 |
++| support_valid | 选区中至少有一端有效支持的比例 |
++| retrieval_error | 最佳有效方向的 RGB L1 误差 |
++| base_error | 当前尺度 RGB 预测在相同统计区域的 L1 误差 |
++| oracle_improvable | 最佳检索 RGB 误差小于当前预测误差的位置比例，仅训练监控 |
++
++除 support_valid 外，以上平均只在选区且至少一端有效的位置统计，排除无效位置对均值的污染。
++两个 BASR 等权汇总，再按训练 batch 平均。低 gate 或低 source_usage 本身不等于塌缩：应结合有效支持比例、检索误差及可改善比例判断。
++CSV 是每 epoch 一行，包含损失、监控量、global_step 与学习率。
++
++## 5. 使用命令
++
++使用已经能运行原项目的环境即可。新增代码使用 PyTorch 标准算子，仍依赖原有 torchvision DCN。
++较小依赖清单为 `requirements_basr.txt`；选择匹配的 torch/torchvision CUDA 构建。
++
++从 DSER++ 原版权重，或上一版 Learned BASR 权重迁移：
++
++```bash
++python train_bsergb.py --data-root "/path/to/BSERGB/3_TRAINING" --pretrained train/bsergb/last.pth --basr-mode learned --epochs 20 --lr 1e-5 --batch-size 1 --crop-size 256 --skips 1 3 --repair-ratio 0.25 --lambda-retrieve 0.1 --output-dir train/bsergb_learned_basr_v2
++```
++
++从头训练：
++
++```bash
++python train_bsergb.py --data-root "/path/to/BSERGB/3_TRAINING" --basr-mode learned --epochs 40 --lr 1e-4 --batch-size 1 --crop-size 256 --skips 1 3 --output-dir train/bsergb_learned_basr_v2_scratch
++```
++
++断点续训 V2：
++
++```bash
++python train_bsergb.py --data-root "/path/to/BSERGB/3_TRAINING" --resume train/bsergb_learned_basr_v2/last.pth --basr-mode learned --epochs 20 --batch-size 1 --crop-size 256 --skips 1 3 --repair-ratio 0.25 --lambda-retrieve 0.1 --output-dir train/bsergb_learned_basr_v2
++```
++
++保持原先总 epochs、数据设置、结构配置和损失系数，以延续学习率调度与实验条件。
++V1 转 V2 必须使用 --pretrained；--resume 和直接 V2 推理会拒绝 V1 权重。
++迁移时重建两处 BASR；保留匹配 backbone 和已有难度头。原版 DSER++ 则同时新建难度头。
++同版本 V2 的 --pretrained、--resume 及推理正常加载全部匹配参数。
++日志显示迁移版本及丢弃/新增键数量；非 BASR 主干不匹配仍报错，默认不需要 --allow-partial-pretrained。
++
++测试：
++
++```bash
++python interpolation.py --dataset bsergb --data_root_path "/path/to/BSERGB/1_TEST" --checkpoints_path train/bsergb_learned_basr_v2/last.pth --save_root_path eval/learned_basr_v2
++```
++
++完整训练 checkpoint 会自动恢复 bins、patch、选区比例及消融开关；纯 state_dict 不包含实验配置。
++旧 original 权重仍可用 --basr-mode original 评测，旧 learned V1 需用 V1 代码评测或先迁移训练为 V2。
++
++## 6. 消融开关
++
++| 参数 | 用途 |
++|---|---|
++| --basr-mode original | 原 BASR 对照 |
++| --lambda-retrieve 0 | 去掉直接检索损失 |
++| --repair-residual-radius 0 | 关闭候选残差微调 |
++| --disable-modulation-prior | 不使用 DCN 调制先验 |
++| --disable-event-temporal | 去掉显式事件时间统计；其余事件网络仍保留 |
++| --disable-alignment-candidates | 围绕同坐标 3x3 位置检索，并同时禁用不再对应的调制先验 |
++| --repair-ratio 1 | 全部有效 patch 参与检索 |
++| --repair-ratio 0 | 不执行局部修复 |
++
++如果单独研究 E-PCD 位置的作用，应让两组都禁用调制先验，避免混入先验变化。
++同坐标消融的搜索范围更小，不宜解释为同等范围下的纯可靠性对照。
++
++## 7. 验证范围
+ 
+ ```bash
+ python -m unittest discover -s tests -v
+ ```
+ 
+-检查包括：每张图独立 top-k、空事件、padding 排除、采样 (dy,dx) 与真实 torchvision DCN 一致、越界回退、选区外写回为零、分块一致、GT 不进入推理、整网反向传播、严格 backbone 权重迁移。
+-
+-额外检查原模式与基准源码逐张量输出一致，以及合成 BS-ERGB 样本的一步训练和 checkpoint 保存。
+-训练冒烟使用真实 LPIPS 算子但随机 AlexNet 骨干以避免下载，不能用于指标比较；正常训练仍使用原始预训练 LPIPS。
+-没有在你的真实数据上训练，没有验证 CUDA/AMP/多 GPU 的运行或速度。
+-
+-## 六、阅读顺序
+-
+-先看 `model/selective_basr.py`，再看 `ourNet.py` 与 `trans_sys.py` 的接口连接，最后看 `train_bsergb.py` 的 `compute_losses`。
+-`changes.patch` 提供相对基准提交的逐行差异；完整替换代码已包含在相应文件中。
++验证环境为 Python 3.12、PyTorch 2.5.1+cpu、torchvision 0.20.1+cpu、NumPy 1.26.4、einops 0.8.1。
++语法保持 Python 3.10 兼容。
++本次执行记录见 VALIDATION.md，包括初始化时直接检索梯度、粗对齐输入、RGB 证据、先验有效性、边界回退与权重迁移。
++没有在真实 BS-ERGB 上完整训练，没有验证 GPU/AMP/多卡运行或指标提升。
+--- a/README.md
++++ b/README.md
+@@ -1,13 +1,15 @@
+-# DSER++ Learned BASR
++# DSER++ Learned BASR V2
+ 
+-基于 MrLi002/DSER-QQ 的学习支持来源选择性修复实验代码。
++基于 MrLi002/DSER-QQ 的完整修订源码。
+ 
+-- 新增难度预测与 top-k 选区。
+-- 复用 E-PCD 多点采样，学习双向支持与保留来源权重。
+-- 结合事件时间统计，以门控残差控制局部写回。
+-- 保留 original 模式及旧权重迁移。
++本版修正粗对齐残差预测、直接检索监督及 RGB 来源判断证据，加入 DCN 调制弱先验与训练监控 CSV。
+ 
+-**使用前阅读 [MODIFICATION_GUIDE.md](MODIFICATION_GUIDE.md)**，其中有逐文件修改表、机制解释、完整训练/微调/测试命令和验证范围。
++请先阅读 [MODIFICATION_GUIDE.md](MODIFICATION_GUIDE.md)，其中有逐文件修改说明、完整训练/迁移/续训/测试命令及验证边界。
+ 
+-压缩包包含完整文本源码、相对基准提交的 changes.patch、测试和说明；不包含数据、预训练权重及演示图片。
+-源码来源与许可证见 BASE_COMMIT.txt、README_upstream.md、LICENSE。
++- 原版与 V1 权重迁移使用 `--pretrained`，会重新初始化新版 BASR。
++- V1 权重不能通过 `--resume` 直接变成 V2。
++- 保留 `--basr-mode original` 对照。
++- 完整文本源码、差异补丁和测试已包含；不含数据、模型权重及演示图片。
++
++来源、许可证和版本见 BASE_COMMIT.txt、README_upstream.md、LICENSE、VERSION.txt。
++本代码尚未完成真实数据完整训练。
+--- a/VALIDATION.md
++++ b/VALIDATION.md
+@@ -1,21 +1,30 @@
+-# Validation record
++# V2 validation record
+ 
+-Source: MrLi002/DSER-QQ, commit 983d929512d5af48c12960333438546e04a6daaa.
++Source: MrLi002/DSER-QQ @ 983d929512d5af48c12960333438546e04a6daaa.
++Environment: Python 3.12.14, torch 2.5.1+cpu, torchvision 0.20.1+cpu,
++NumPy 1.26.4, einops 0.8.1, OpenCV 4.11.0.
+ 
+-Environment: Python 3.12.14, torch 2.5.1+cpu, torchvision 0.20.1+cpu,
+-einops 0.8.1, NumPy 1.26.4, OpenCV 4.11.0.
++- 19 unit/integration tests passed.
++- Verified that the residual head receives the source feature sampled at a known
++  translated E-PCD candidate, rather than the same-coordinate source feature.
++- Isolated the new RGB retrieval loss at initialization: Q/K, residual offsets
++  and modulation mapping received nonzero gradients while decision and output
++  projection were not part of that gradient path. Stage-B offset/m inputs stayed detached.
++- Checked that explicit retrieved/base RGB and RGB differences reach the decision head.
++- Checked signed modulation priors, invalid-source exclusion, all-invalid and empty
++  selection cases, padding, chunk consistency, selection scope and GT-free forward.
++- Checked original-to-V2 migration and V1-to-V2 migration safeguards; missing
++  unchanged backbone/difficulty keys still fail strict validation.
++- Used an actual V1 model checkpoint to initialize V2 training successfully.
++- Completed one real DataLoader/training iteration on synthetic BS-ERGB-format
++  files, including all losses, backward, clipping, optimizer update, CSV logging
++  and atomic checkpoint save. LPIPS used its real operators with a random AlexNet
++  backbone solely to avoid downloading pretrained weights in this smoke test.
++  Normal training still requests standard pretrained LPIPS.
++- Restored the V2 network, optimizer, scheduler and scaler states.
++- Passed 256x256 inference and inference-wrapper padding/unpadding for 65x97.
++- Original BASR mode matched the source network output tuple exactly: maximum
++  absolute tensor difference 0.0.
+ 
+-- 12 automated unit/integration tests passed.
+-- Original BASR mode loaded original weights and matched the source network's
+-  complete output tuple exactly (maximum tensor difference 0.0).
+-- A synthetic BS-ERGB sample passed the actual DataLoader, full model,
+-  reconstruction/refinement/selection losses, backward pass, gradient clipping,
+-  optimizer update and atomic checkpoint save.
+-- That smoke test used LPIPS operators with a random AlexNet backbone solely
+-  to avoid downloading pretrained weights. Normal training behavior is unchanged.
+-- Network, optimizer, scheduler and scaler checkpoint states restored successfully.
+-- A 256x256 inference passed using the smoke-test checkpoint.
+-- The inference wrapper handled a 65x97 input and restored the original size.
+-
+-This is functional validation, not a quality benchmark. No full real-dataset
+-training, GPU/AMP/multi-GPU run, PSNR/SSIM/LPIPS evaluation, or speed claim is made.
++This is functional validation. No full real-data training, quality improvement,
++CUDA/AMP/multi-GPU validation, GPU memory measurement or speed claim is made.
+--- /dev/null
++++ b/VERSION.txt
+@@ -0,0 +1,2 @@
++Learned BASR revision: 2
++Base: MrLi002/DSER-QQ @ 983d929512d5af48c12960333438546e04a6daaa
+--- a/model/blocks.py
++++ b/model/blocks.py
+@@ -206,7 +206,8 @@
+         out = self.lastconv(F0_2_)
+         if return_alignment:
+             # Half, quarter, eighth resolution; Stage-B values are unchanged.
+-            return out, [off_2, off_1, off_0]
++            return out, dict(offsets=[off_2, off_1, off_0],
++                             modulation=[m_2, m_1, m_0])
+         return out
+ 
+ 
+--- a/model/checkpoints.py
++++ b/model/checkpoints.py
+@@ -37,36 +37,52 @@
+                             for k in extract_state_dict(checkpoint)) else "original"
+ 
+ 
++def checkpoint_revision(checkpoint):
++    state = extract_state_dict(checkpoint)
++    if not any(key.startswith("difficulty_head.") for key in state):
++        return 0
++    return 2 if any(".retriever.modulation_projection." in key for key in state) else 1
++
++
+ def load_network_state(model, checkpoint, allow_basr_migration=False, allow_partial=False):
+     network = model.module if isinstance(model, torch.nn.DataParallel) else model
+     state = extract_state_dict(checkpoint)
+     source_mode = checkpoint_mode(checkpoint)
+     target_mode = getattr(network, "basr_mode", source_mode)
+-    migration = source_mode == "original" and target_mode == "learned" and allow_basr_migration
++    source_revision = checkpoint_revision(checkpoint)
++    target_revision = getattr(network, "basr_revision", source_revision)
++    changed = source_mode != target_mode or (source_mode == "learned" and source_revision != target_revision)
++    migration = (changed and target_mode == "learned" and allow_basr_migration
++                 and source_revision < target_revision)
+     repair_prefixes = ("sys.refine_block0.", "sys.refine_block1.")
+     dropped = []
+     if migration:
+         dropped = [key for key in state if key.startswith(repair_prefixes)]
+         state = {key: value for key, value in state.items() if key not in dropped}
+-    elif source_mode != target_mode:
++    elif changed:
+         raise RuntimeError("Checkpoint/model BASR modes differ. Use --pretrained for "
+-                           "original-to-learned migration, or select the matching mode.")
++                           "old-to-new BASR migration, or select the matching code version.")
+     incompatible = network.load_state_dict(state, strict=False)
+     missing, unexpected = list(incompatible.missing_keys), list(incompatible.unexpected_keys)
+-    allowed = repair_prefixes + ("difficulty_head.",) if migration else ()
++    allowed = (repair_prefixes + (("difficulty_head.",) if source_mode == "original" else ())) if migration else ()
+     forbidden_missing = [key for key in missing if not key.startswith(allowed)]
+     if not allow_partial and (forbidden_missing or unexpected):
+         raise RuntimeError(f"Backbone/checkpoint mismatch: missing={forbidden_missing}; "
+                            f"unexpected={unexpected}")
+-    return dict(migrated=migration, missing=missing, unexpected=unexpected, dropped=dropped)
++    return dict(migrated=migration, missing=missing, unexpected=unexpected, dropped=dropped,
++                source_revision=source_revision, target_revision=target_revision)
+ 
+ 
+ MODEL_DEFAULTS = dict(bins=8, mask_patch_size=32, repair_ratio=0.25,
+                       repair_residual_radius=2.0, repair_chunk_size=1024,
+-                      disable_event_temporal=False, disable_alignment_candidates=False)
++                      disable_event_temporal=False, disable_alignment_candidates=False,
++                      disable_modulation_prior=False)
+ 
+ 
+ def configure_inference_args(args, checkpoint):
++    if checkpoint_mode(checkpoint) == "learned" and checkpoint_revision(checkpoint) != 2:
++        raise ValueError("This is a V1 learned-BASR checkpoint. Use the V1 code for inference, "
++                         "or --pretrained with V2 training to migrate the backbone.")
+     saved = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+     if not isinstance(saved, dict):
+         saved = vars(saved)
+@@ -84,8 +100,10 @@
+     if args.basr_mode != expected_mode:
+         raise ValueError("--resume requires the same architecture. To start learned BASR "
+                          "from original weights, use --pretrained instead.")
++    if expected_mode == "learned" and checkpoint_revision(checkpoint) != 2:
++        raise ValueError("V1-to-V2 migration requires --pretrained, not --resume")
+     keys = ("bins", "mask_patch_size", "repair_ratio", "repair_residual_radius",
+-            "disable_event_temporal", "disable_alignment_candidates")
++            "disable_event_temporal", "disable_alignment_candidates", "disable_modulation_prior")
+     for key in keys:
+         if key in saved and getattr(args, key) != saved[key]:
+             raise ValueError(f"Resume configuration differs for {key}: "
+--- a/model/ourNet.py
++++ b/model/ourNet.py
+@@ -13,11 +13,13 @@
+         self.beta = args.beta
+         self.mask_patch_size = args.mask_patch_size
+         self.basr_mode = getattr(args, "basr_mode", None) or "learned"
++        self.basr_revision = 2
+         if self.basr_mode not in ("original", "learned"):
+             raise ValueError("basr_mode must be original or learned")
+         self.repair_ratio = getattr(args, "repair_ratio", 0.25)
+         self.use_temporal = not getattr(args, "disable_event_temporal", False)
+         self.use_alignment = not getattr(args, "disable_alignment_candidates", False)
++        self.use_modulation = not getattr(args, "disable_modulation_prior", False)
+         self.event_rec = EventRecNet(2 * bins)
+         self.TNet = FeaTNet(bins)
+         self.fusion = DenseBlock(64, 3)
+@@ -40,8 +42,9 @@
+         rec = pure_rec * mask
+         learned = self.basr_mode == "learned"
+         if learned:
+-            F0, offsets0 = self.TNet(img0, img1, v0t, rec, return_alignment=True)
+-            F1, offsets1 = self.TNet(img1, img0, v1t, rec, return_alignment=True)
++            F0, alignment0 = self.TNet(img0, img1, v0t, rec, return_alignment=True)
++            F1, alignment1 = self.TNet(img1, img0, v1t, rec, return_alignment=True)
++            offsets0, offsets1 = alignment0["offsets"], alignment1["offsets"]
+         else:
+             F0 = self.TNet(img0, img1, v0t, rec)
+             F1 = self.TNet(img1, img0, v1t, rec)
+@@ -65,7 +68,9 @@
+                 offsets1 = [torch.zeros_like(x) for x in offsets1]
+             context = dict(offsets0=offsets0, offsets1=offsets1, temporal=temporal,
+                            selected=selected, difficulty=difficulty, rgb0=img0, rgb1=img1,
+-                           valid_mask=valid_mask)
++                           valid_mask=valid_mask,
++                           modulation0=alignment0["modulation"] if self.use_modulation and self.use_alignment else [None] * 3,
++                           modulation1=alignment1["modulation"] if self.use_modulation and self.use_alignment else [None] * 3)
+             predictions, stages = self.sys(event_feature, frame_feature, ref_feature,
+                                           f_frame0, f_frame1, repair_context=context)
+             corr_list = [torch.nn.functional.adaptive_max_pool2d(selected, f.shape[-2:])
+--- a/model/selective_basr.py
++++ b/model/selective_basr.py
+@@ -84,12 +84,11 @@
+ 
+ 
+ class TargetGridRetriever(nn.Module):
+-    """Sample source features at E-PCD candidates for selected target pixels.
+-
+-    Coarse-to-fine E-PCD offsets are read at the same scale as the source.
+-    This preserves all nine sampling points, rather than pretending that the
+-    18 offset channels form one optical-flow field. A learned bounded residual
+-    can adjust each candidate. Chunking bounds the sampled-tensor memory.
++    """Two-pass retrieval: sample coarse candidates, then predict residuals.
++
++    The residual predictor sees source features already transported onto the
++    target grid. DCN offsets/modulation inputs are detached; their original
++    stage-B optimization remains unchanged.
+     """
+     def __init__(self, channels, residual_radius=2.0, chunk_size=1024):
+         super().__init__()
+@@ -100,91 +99,111 @@
+         self.query = nn.Conv2d(channels, channels, 1)
+         self.key = nn.Conv2d(channels, channels, 1)
+         self.value = nn.Conv2d(channels, channels, 1)
++        # target C + coarse-aligned raw source C + time cues 7 + validity 1
+         self.offset_residual = nn.Sequential(
+-            nn.Conv2d(channels * 2 + 7, channels, 3, padding=1),
+-            nn.LeakyReLU(0.1), nn.Conv2d(channels, 18, 1),
+-        )
++            nn.Conv2d(channels * 2 + 8, channels, 3, padding=1),
++            nn.LeakyReLU(0.1), nn.Conv2d(channels, 18, 1))
+         nn.init.zeros_(self.offset_residual[-1].weight)
+         nn.init.zeros_(self.offset_residual[-1].bias)
+         self.log_temperature = nn.Parameter(torch.tensor(math.log(0.1)))
++        # Original DCN modulation is signed/unbounded. Map it to a learned
++        # positive distribution instead of taking log(raw_m).
++        self.modulation_projection = nn.Conv2d(9, 9, 1)
++        with torch.no_grad():
++            self.modulation_projection.weight.copy_(torch.eye(9).view(9, 9, 1, 1))
++            self.modulation_projection.bias.zero_()
++        self.prior_logit = nn.Parameter(torch.tensor(math.log(0.1 / 0.9)))
+         kernel = [(y, x) for y in (-1, 0, 1) for x in (-1, 0, 1)]
+         self.register_buffer("kernel_yx", torch.tensor(kernel).float(), persistent=False)
+ 
+-    def forward(self, target, source, rgb, offsets, temporal, selected, source_valid=None):
+-        b, c, h, w = target.shape
+-        if source.shape != target.shape or offsets.shape != (b, 18, h, w):
+-            raise ValueError("E-PCD offsets and source features must share the target scale")
+-        if rgb.shape != (b, 3, h, w):
+-            raise ValueError("Source RGB must match the feature scale")
+-        q = self.query(target)
+-        source_valid = torch.ones_like(source[:, :1]) if source_valid is None else source_valid.to(source)
+-        kv = torch.cat((self.key(source), self.value(source), rgb.to(source), source_valid), 1).float()
+-        residual = self.radius * torch.tanh(self.offset_residual(
+-            torch.cat((target, source, temporal.to(target)), 1)))
+-        # Detaching the E-PCD candidates prevents new routing losses from
+-        # repurposing its alignment offsets. Stage-B losses still train E-PCD.
+-        all_offsets = (offsets.detach() + residual).reshape(b, 9, 2, h * w).float()
++    def _modulation_prior(self, modulation, reference):
++        b, _, h, w = reference.shape
++        if modulation is None:
++            return reference.new_zeros(b, 9, h * w).float()
++        if modulation.shape != (b, 9, h, w):
++            raise ValueError("DCN modulation must have shape [B, 9, H, W]")
++        mapped = self.modulation_projection(modulation.detach().to(reference)).float()
++        return (self.prior_logit.sigmoid() * mapped.log_softmax(1)).flatten(2)
++
++    def _sample(self, query_map, maps, offsets, selected, prior):
++        b, c, h, w = query_map.shape
++        all_offsets = offsets.reshape(b, 9, 2, h * w).float()
+         temperature = self.log_temperature.exp().clamp(0.03, 1.0)
+-        support_batches, color_batches, valid_batches, score_batches = [], [], [], []
++        batches = [[] for _ in range(5)]
+         for batch in range(b):
+             indices = (selected[batch, 0].flatten() > 0).nonzero(as_tuple=False).flatten()
+-            support = target.new_zeros(c, h * w)
+-            colors = target.new_zeros(3, h * w)
+-            valid_map = target.new_zeros(1, h * w)
+-            score_map = target.new_zeros(1, h * w)
++            results = [query_map.new_zeros(channels, h * w)
++                       for channels in (c, 3, 1, 1, c)]
+             for start in range(0, indices.numel(), self.chunk_size):
+                 idx = indices[start:start + self.chunk_size]
+                 delta = all_offsets[batch, :, :, idx].permute(2, 0, 1)
+-                # Coordinate order here is (y, x), matching torchvision DCN.
+                 yx = torch.stack((idx // w, idx % w), -1).float()[:, None, :]
+-                sample_yx = yx + self.kernel_yx[None, :, :] + delta
++                sample_yx = yx + self.kernel_yx[None] + delta
+                 sy, sx = sample_yx[..., 0], sample_yx[..., 1]
+                 valid = (sx >= 0) & (sx <= w - 1) & (sy >= 0) & (sy <= h - 1)
+                 grid = torch.stack((2 * sx / max(w - 1, 1) - 1,
+                                     2 * sy / max(h - 1, 1) - 1), -1)
+-                sampled = F.grid_sample(kv[batch:batch + 1], grid[None],
++                sampled = F.grid_sample(maps[batch:batch + 1], grid[None],
+                                         align_corners=True, padding_mode="zeros")[0]
+-                keys, values, sampled_rgb, sampled_valid = sampled.split((c, c, 3, 1), 0)
++                keys, values, rgb, sampled_valid, raw_source = sampled.split((c, c, 3, 1, c), 0)
+                 valid = valid & (sampled_valid[0] >= 0.999)
+-                query = q[batch].reshape(c, -1)[:, idx].float()
++                query = query_map[batch].reshape(c, -1)[:, idx].float()
+                 similarity = (F.normalize(query, dim=0)[:, :, None]
+                               * F.normalize(keys, dim=0)).sum(0)
+-                logits = (similarity / temperature).masked_fill(~valid, -1e4)
++                logits = similarity / temperature + prior[batch, :, idx].transpose(0, 1)
++                logits = logits.masked_fill(~valid, -1e4)
+                 attention = logits.softmax(-1) * valid.float()
+                 attention = attention / attention.sum(-1, keepdim=True).clamp_min(1e-6)
+-                retrieved = (values * attention[None]).sum(-1)
+-                retrieved_rgb = (sampled_rgb * attention[None]).sum(-1)
+-                supported = valid.any(-1).to(target.dtype)
+-                score = (similarity * attention).sum(-1)
+-                support = support.index_copy(1, idx, retrieved.to(target.dtype))
+-                colors = colors.index_copy(1, idx, retrieved_rgb.to(target.dtype))
+-                valid_map = valid_map.index_copy(1, idx, supported[None])
+-                score_map = score_map.index_copy(1, idx, score[None].to(target.dtype))
+-            support_batches.append(support.view(c, h, w))
+-            color_batches.append(colors.view(3, h, w))
+-            valid_batches.append(valid_map.view(1, h, w))
+-            score_batches.append(score_map.view(1, h, w))
+-        return tuple(torch.stack(items) for items in (
+-            support_batches, color_batches, valid_batches, score_batches))
++                updates = ((values * attention[None]).sum(-1),
++                           (rgb * attention[None]).sum(-1),
++                           valid.any(-1).float()[None],
++                           (similarity * attention).sum(-1)[None],
++                           (raw_source * attention[None]).sum(-1))
++                results = [value.index_copy(1, idx, update.to(query_map.dtype))
++                           for value, update in zip(results, updates)]
++            for bucket, value in zip(batches, results):
++                bucket.append(value.view(-1, h, w))
++        return tuple(torch.stack(bucket) for bucket in batches)
++
++    def forward(self, target, source, rgb, offsets, temporal, selected,
++                source_valid=None, modulation=None):
++        b, c, h, w = target.shape
++        if source.shape != target.shape or offsets.shape != (b, 18, h, w):
++            raise ValueError("E-PCD offsets and features must share the target scale")
++        if rgb.shape != (b, 3, h, w):
++            raise ValueError("Source RGB must match the feature scale")
++        source_valid = torch.ones_like(source[:, :1]) if source_valid is None else source_valid.to(source)
++        query = self.query(target)
++        maps = torch.cat((self.key(source), self.value(source), rgb.to(source),
++                          source_valid, source), 1).float()
++        prior = self._modulation_prior(modulation, target)
++        coarse_offsets = offsets.detach()
++        coarse = self._sample(query, maps, coarse_offsets, selected, prior)
++        coarse_aligned, coarse_valid = coarse[4], coarse[2]
++        residual = self.radius * torch.tanh(self.offset_residual(torch.cat(
++            (target, coarse_aligned, temporal.to(target), coarse_valid), 1)))
++        refined = self._sample(query, maps, coarse_offsets + residual, selected, prior)
++        return refined[:4]
+ 
+ 
+ class LearnedDetailsSup(nn.Module):
+     def __init__(self, channels, high_channels, residual_radius=2.0, chunk_size=1024):
+         super().__init__()
+         self.retriever = TargetGridRetriever(channels, residual_radius, chunk_size)
++        # Latents 3C; time/error/validity/matching 12; explicit RGB evidence 15.
++        # Remove uncalibrated |decoder_feature - value(source_feature)| terms.
+         self.decision = nn.Sequential(
+-            nn.Conv2d(channels * 5 + 12, channels * 2, 3, padding=1),
+-            nn.LeakyReLU(0.1), nn.Conv2d(channels * 2, 4, 1),
+-        )
++            nn.Conv2d(channels * 3 + 27, channels * 2, 3, padding=1),
++            nn.LeakyReLU(0.1), nn.Conv2d(channels * 2, 4, 1))
+         nn.init.zeros_(self.decision[-1].weight)
+         with torch.no_grad():
+             self.decision[-1].bias.copy_(torch.tensor([0., 0., 2., -2.]))
+-        # A zero projection starts from the decoder without local repair.
+         self.to_high = nn.Conv2d(channels, high_channels, 1, bias=False)
+         nn.init.zeros_(self.to_high.weight)
+ 
+     def forward(self, target, source0, source1, base_high, offsets0, offsets1,
+-                temporal, selected, difficulty, rgb0, rgb1, base_rgb, valid_mask=None):
++                temporal, selected, difficulty, rgb0, rgb1, base_rgb, valid_mask=None,
++                modulation0=None, modulation1=None):
+         size = target.shape[-2:]
+         temporal = F.interpolate(temporal, size=size, mode="bilinear", align_corners=False)
+         selected_low = F.adaptive_max_pool2d(selected, size).to(target)
+@@ -193,12 +212,13 @@
+         rgb1 = F.interpolate(rgb1, size=size, mode="bilinear", align_corners=False)
+         source_valid = None if valid_mask is None else F.interpolate(valid_mask, size=size, mode="nearest")
+         support0, color0, valid0, score0 = self.retriever(
+-            target, source0, rgb0, offsets0, temporal, selected_low, source_valid)
++            target, source0, rgb0, offsets0, temporal, selected_low, source_valid, modulation0)
+         support1, color1, valid1, score1 = self.retriever(
+-            target, source1, rgb1, offsets1, temporal, selected_low, source_valid)
+-        inputs = torch.cat((target, support0, support1, (target - support0).abs(),
+-                            (target - support1).abs(), temporal.to(target), error_low,
+-                            valid0, valid1, score0, score1), 1)
++            target, source1, rgb1, offsets1, temporal, selected_low, source_valid, modulation1)
++        base_rgb = base_rgb.to(target)
++        inputs = torch.cat((target, support0, support1, temporal.to(target), error_low,
++                            valid0, valid1, score0, score1, color0, color1, base_rgb,
++                            (color0 - base_rgb).abs(), (color1 - base_rgb).abs()), 1)
+         decision = self.decision(inputs).float()
+         logits = torch.cat((decision[:, :1].masked_fill(valid0 == 0, -1e4),
+                             decision[:, 1:2].masked_fill(valid1 == 0, -1e4),
+@@ -212,8 +232,6 @@
+         delta = F.interpolate(delta, size=base_high.shape[-2:], mode="bilinear",
+                               align_corners=False)
+         repair_high = F.adaptive_max_pool2d(selected, base_high.shape[-2:]).to(base_high)
+-        # Mask after interpolation/projection to prevent writes outside the
+-        # selected region. Later global decoder layers can still propagate it.
+         output = base_high + repair_high * self.to_high(delta)
+         aux = dict(route_logits=logits, gate_logits=gate_logits, weights=weights,
+                    gate=gate, selected=selected_low, rgb0=color0, rgb1=color1,
+@@ -223,39 +241,64 @@
+ 
+ def basr_auxiliary_losses(aux, coarse, gt, patch_size=32, temperature=0.05,
+                           gate_margin=0.02):
+-    """GT-only training targets; no auxiliary target is fed into the network.
+-
+-    Routing/gate targets are photometric proxy labels for candidate usefulness,
+-    not ground-truth visibility. Detach them to avoid a moving-target shortcut.
++    """Detached route/gate labels plus an independent differentiable RGB loss.
++
++    Retrieval loss is not multiplied by gate, source weights or to_high. Its
++    best-valid-side Charbonnier objective trains sampling/matching from step 1.
++    Validity is a sampling condition, not a ground-truth visibility label.
+     """
+     predicted_error = aux["difficulty"].float()
+     error_target = (coarse.detach().float() - gt.float()).abs().mean(1, keepdim=True)
+     difficulty = F.smooth_l1_loss(predicted_error, error_target, beta=0.01)
+-    p = patch_size
+     difficulty = difficulty + F.l1_loss(
+-        F.avg_pool2d(predicted_error, p, p, ceil_mode=True),
+-        F.avg_pool2d(error_target, p, p, ceil_mode=True))
+-    route_losses, gate_losses = [], []
++        F.avg_pool2d(predicted_error, patch_size, patch_size, ceil_mode=True),
++        F.avg_pool2d(error_target, patch_size, patch_size, ceil_mode=True))
++    losses = {name: [] for name in ("route", "gate", "retrieve")}
++    metrics = {name: [] for name in ("source_usage", "gate_mean", "effective_usage",
++                                   "support_valid", "retrieval_error", "base_error",
++                                   "oracle_improvable")}
+     for stage in aux["stages"]:
+         selected = stage["selected"].float()
+         target = F.interpolate(gt.float(), size=selected.shape[-2:], mode="bilinear",
+                                align_corners=False)
++        colors = (stage["rgb0"].float(), stage["rgb1"].float())
++        valid_sources = torch.cat((stage["valid0"], stage["valid1"]), 1).bool()
++        eligible = selected * valid_sources.any(1, keepdim=True).float()
++        eligible_count = eligible.sum().clamp_min(1)
++        # This computation must remain outside no_grad and must not detach RGB.
++        rgb_errors = torch.cat([(torch.sqrt((rgb - target).square() + 1e-6)
++                                 - 1e-3).mean(1, keepdim=True) for rgb in colors], 1)
++        best_rgb_error = rgb_errors.masked_fill(~valid_sources, 1e4).amin(1, keepdim=True)
++        # Invalid/all-empty samples contribute zero while preserving the graph.
++        losses["retrieve"].append((best_rgb_error * eligible).sum() / eligible_count)
+         with torch.no_grad():
+-            candidates = (stage["rgb0"], stage["rgb1"], stage["base_rgb"])
+             errors = torch.cat([(rgb.detach().float() - target).abs().mean(1, keepdim=True)
+-                                for rgb in candidates], 1)
+-            valid = torch.cat((stage["valid0"], stage["valid1"],
+-                               torch.ones_like(stage["valid0"])), 1).bool()
++                                for rgb in (*colors, stage["base_rgb"])], 1)
++            valid = torch.cat((valid_sources, torch.ones_like(valid_sources[:, :1])), 1)
+             targets = (-errors / temperature).masked_fill(~valid, -1e4).softmax(1)
+-            best_support = errors[:, :2].masked_fill(~valid[:, :2], 1e4).amin(1, keepdim=True)
++            best_support = errors[:, :2].masked_fill(~valid_sources, 1e4).amin(1, keepdim=True)
+             gate_target = ((errors[:, 2:3] - best_support) / gate_margin).clamp(0, 1)
++            def average(value):
++                return (value * eligible).sum() / eligible_count
++            external = stage["weights"][:, :2].float().sum(1, keepdim=True)
++            gate = stage["gate"].float()
++            metrics["source_usage"].append(average(external))
++            metrics["gate_mean"].append(average(gate))
++            metrics["effective_usage"].append(average(external * gate))
++            metrics["support_valid"].append(eligible.sum() / selected.sum().clamp_min(1))
++            metrics["retrieval_error"].append(average(best_support))
++            metrics["base_error"].append(average(errors[:, 2:3]))
++            metrics["oracle_improvable"].append(average((best_support < errors[:, 2:3]).float()))
+         denominator = selected.sum().clamp_min(1)
+         route_map = -(targets * stage["route_logits"].log_softmax(1)).sum(1, keepdim=True)
+         gate_map = F.binary_cross_entropy_with_logits(stage["gate_logits"], gate_target,
+                                                      reduction="none")
+-        route_losses.append((route_map * selected).sum() / denominator)
+-        gate_losses.append((gate_map * selected).sum() / denominator)
++        losses["route"].append((route_map * selected).sum() / denominator)
++        losses["gate"].append((gate_map * selected).sum() / denominator)
+     zero = predicted_error.sum() * 0
+-    return dict(difficulty=difficulty,
+-                route=torch.stack(route_losses).mean() if route_losses else zero,
+-                gate=torch.stack(gate_losses).mean() if gate_losses else zero)
++    result = {"difficulty": difficulty}
++    result.update({name: torch.stack(values).mean() if values else zero
++                   for name, values in losses.items()})
++    result.update({name: torch.stack(values).mean() if values else zero.detach()
++                   for name, values in metrics.items()})
++    return result
+--- a/model/trans_sys.py
++++ b/model/trans_sys.py
+@@ -362,7 +362,8 @@
+                 out0, f_frame0[2], f_frame1[2], up_out0,
+                 ctx["offsets0"][1], ctx["offsets1"][1], ctx["temporal"],
+                 ctx["selected"], ctx["difficulty"], ctx["rgb0"], ctx["rgb1"], img0,
+-                valid_mask=ctx["valid_mask"])
++                valid_mask=ctx["valid_mask"], modulation0=ctx["modulation0"][1],
++                modulation1=ctx["modulation1"][1])
+             stages.append(stage)
+ 
+         # out 1
+@@ -386,7 +387,8 @@
+                 out1, f_frame0[1], f_frame1[1], up_out1,
+                 ctx["offsets0"][0], ctx["offsets1"][0], ctx["temporal"],
+                 ctx["selected"], ctx["difficulty"], ctx["rgb0"], ctx["rgb1"], img1,
+-                valid_mask=ctx["valid_mask"])
++                valid_mask=ctx["valid_mask"], modulation0=ctx["modulation0"][0],
++                modulation1=ctx["modulation1"][0])
+             stages.append(stage)
+ 
+         # out2
+--- a/tests/test_selective_basr.py
++++ b/tests/test_selective_basr.py
+@@ -9,7 +9,8 @@
+ from model.selective_basr import (
+     temporal_event_features, select_topk_patches, DifficultyHead,
+     TargetGridRetriever, LearnedDetailsSup, basr_auxiliary_losses)
+-from model.checkpoints import load_network_state, configure_inference_args
++from model.checkpoints import (load_network_state, configure_inference_args,
++                               validate_resume_args, checkpoint_revision)
+ from model.ourNet import MyNet
+ 
+ torch.set_num_threads(2)
+@@ -201,6 +202,142 @@
+         del model, output, losses
+         gc.collect()
+ 
++
++class V2CorrectionTests(unittest.TestCase):
++    def _inputs(self, selected=True):
++        inputs = RetrievalTests()._block_inputs()
++        inputs["selected"].fill_(int(selected))
++        inputs["modulation0"] = torch.randn(1, 9, 8, 8, requires_grad=True)
++        inputs["modulation1"] = torch.randn(1, 9, 8, 8, requires_grad=True)
++        inputs["offsets0"].requires_grad_()
++        inputs["offsets1"].requires_grad_()
++        return inputs
++
++    def test_residual_receives_coarse_aligned_source(self):
++        retriever = TargetGridRetriever(4, residual_radius=0)
++        source = torch.arange(56).float().view(1, 1, 7, 8).repeat(1, 4, 1, 1)
++        offsets = torch.full((1, 18, 7, 8), 1000.)
++        offsets[:, 8] = 0
++        offsets[:, 9] = 2
++        selected = torch.zeros(1, 1, 7, 8)
++        selected[:, :, 3, 2] = 1
++        captured = []
++        handle = retriever.offset_residual[0].register_forward_pre_hook(
++            lambda module, values: captured.append(values[0].detach()))
++        retriever(torch.zeros_like(source), source, source[:, :3] / 56,
++                  offsets, torch.zeros(1, 7, 7, 8), selected)
++        handle.remove()
++        aligned = captured[0][:, 4:8, 3, 2]
++        self.assertTrue(torch.allclose(aligned, source[:, :, 3, 4], atol=1e-5))
++        self.assertFalse(torch.allclose(aligned, source[:, :, 3, 2]))
++        self.assertEqual(captured[0][0, -1, 3, 2].item(), 1)
++
++    def test_direct_rgb_loss_trains_retrieval_at_initialization(self):
++        torch.manual_seed(9)
++        block = LearnedDetailsSup(4, 8, chunk_size=16)
++        inputs = self._inputs()
++        _, stage = block(**inputs)
++        aux = dict(difficulty=torch.rand(1, 1, 16, 16, requires_grad=True), stages=[stage])
++        losses = basr_auxiliary_losses(aux, torch.rand(1, 3, 16, 16),
++                                       torch.rand(1, 3, 16, 16), patch_size=4)
++        # No main, routing or gate objective participates in this backward.
++        losses["retrieve"].backward()
++        for name in ("retriever.query.weight", "retriever.key.weight",
++                     "retriever.offset_residual.2.weight",
++                     "retriever.modulation_projection.weight", "retriever.prior_logit"):
++            gradient = dict(block.named_parameters())[name].grad
++            self.assertIsNotNone(gradient, name)
++            self.assertGreater(gradient.abs().sum().item(), 0, name)
++        self.assertIsNone(block.to_high.weight.grad)
++        self.assertIsNone(block.decision[-1].weight.grad)
++        value_gradient = block.retriever.value.weight.grad
++        self.assertTrue(value_gradient is None or value_gradient.abs().sum().item() == 0)
++        self.assertIsNone(inputs["offsets0"].grad)
++        self.assertIsNone(inputs["modulation0"].grad)
++
++    def test_decision_sees_rgb_and_rgb_differences(self):
++        block = LearnedDetailsSup(4, 8)
++        inputs = self._inputs()
++        captured = []
++        handle = block.decision[0].register_forward_pre_hook(
++            lambda module, values: captured.append(values[0].detach()))
++        _, stage = block(**inputs)
++        handle.remove()
++        evidence = captured[0][:, 3 * 4 + 12:]
++        expected = torch.cat((stage["rgb0"], stage["rgb1"], stage["base_rgb"],
++                              (stage["rgb0"] - stage["base_rgb"]).abs(),
++                              (stage["rgb1"] - stage["base_rgb"]).abs()), 1)
++        self.assertEqual(evidence.shape[1], 15)
++        self.assertTrue(torch.equal(evidence, expected.detach()))
++
++    def test_signed_modulation_prior_is_finite_and_optional(self):
++        module = TargetGridRetriever(4, residual_radius=0)
++        source = torch.rand(1, 4, 8, 8)
++        arguments = (source, source, source[:, :3], torch.zeros(1, 18, 8, 8),
++                     torch.zeros(1, 7, 8, 8), torch.ones(1, 1, 8, 8))
++        modulation = torch.randn(1, 9, 8, 8) * 10 - 5
++        prior = module._modulation_prior(modulation, source)
++        self.assertTrue(torch.isfinite(prior).all())
++        self.assertTrue(torch.isfinite(module(*arguments, modulation=modulation)[0]).all())
++        self.assertEqual(module._modulation_prior(None, source).abs().sum().item(), 0)
++
++    def test_rgb_loss_skips_invalid_source_and_all_invalid(self):
++        rgb0 = torch.ones(1, 3, 4, 4, requires_grad=True)
++        rgb1 = torch.ones(1, 3, 4, 4, requires_grad=True) * .5
++        stage = dict(rgb0=rgb0, rgb1=rgb1, base_rgb=torch.zeros(1, 3, 4, 4),
++                     selected=torch.ones(1, 1, 4, 4), valid0=torch.zeros(1, 1, 4, 4),
++                     valid1=torch.ones(1, 1, 4, 4), route_logits=torch.zeros(1, 3, 4, 4),
++                     gate_logits=torch.zeros(1, 1, 4, 4), weights=torch.ones(1, 3, 4, 4) / 3,
++                     gate=torch.ones(1, 1, 4, 4) / 2)
++        aux = dict(difficulty=torch.zeros(1, 1, 4, 4), stages=[stage])
++        losses = basr_auxiliary_losses(aux, torch.zeros(1, 3, 4, 4),
++                                       torch.zeros(1, 3, 4, 4), patch_size=4)
++        self.assertAlmostEqual(losses["retrieve"].item(), .499001, places=5)
++        losses["retrieve"].backward()
++        self.assertEqual(rgb0.grad.abs().sum().item(), 0)
++        stage["valid1"].zero_()
++        losses = basr_auxiliary_losses(aux, torch.zeros(1, 3, 4, 4),
++                                       torch.zeros(1, 3, 4, 4), patch_size=4)
++        self.assertEqual(losses["retrieve"].item(), 0)
++        self.assertEqual(losses["support_valid"].item(), 0)
++        self.assertTrue(all(torch.isfinite(value) for value in losses.values()))
++
++    def test_usage_metrics_ignore_unselected_pixels(self):
++        block = LearnedDetailsSup(4, 8)
++        inputs = self._inputs()
++        inputs["selected"][:, :, 8:] = 0
++        _, stage = block(**inputs)
++        losses = basr_auxiliary_losses(
++            dict(difficulty=inputs["difficulty"], stages=[stage]),
++            torch.rand(1, 3, 16, 16), torch.rand(1, 3, 16, 16), patch_size=4)
++        self.assertAlmostEqual(losses["source_usage"].item(), .21301396, places=5)
++        self.assertAlmostEqual(losses["gate_mean"].item(), .11920292, places=5)
++        self.assertAlmostEqual(losses["effective_usage"].item(), .0253919, places=5)
++        self.assertEqual(losses["support_valid"].item(), 1)
++        self.assertFalse(losses["gate_mean"].requires_grad)
++
++    def test_v1_migration_is_explicit_and_preserves_difficulty(self):
++        model = MyNet(args())
++        state = dict(model.state_dict())
++        v1 = {key: value for key, value in state.items()
++              if ".retriever.modulation_projection." not in key and not key.endswith(".retriever.prior_logit")}
++        self.assertEqual(checkpoint_revision(v1), 1)
++        with self.assertRaisesRegex(RuntimeError, "modes differ"):
++            load_network_state(model, v1)
++        report = load_network_state(model, v1, allow_basr_migration=True)
++        self.assertEqual((report["source_revision"], report["target_revision"]), (1, 2))
++        self.assertTrue(all(key.startswith(("sys.refine_block0.", "sys.refine_block1."))
++                            for key in report["missing"]))
++        with self.assertRaisesRegex(ValueError, "V1"):
++            configure_inference_args(SimpleNamespace(), v1)
++        with self.assertRaisesRegex(ValueError, "V1"):
++            validate_resume_args(args(), dict(net=v1))
++        broken = {key: value for key, value in v1.items() if key != "difficulty_head.net.0.weight"}
++        with self.assertRaisesRegex(RuntimeError, "Backbone/checkpoint mismatch"):
++            load_network_state(model, broken, allow_basr_migration=True)
++        del model, state, v1
++        gc.collect()
++
+     def test_original_checkpoint_migration_and_strict_backbone(self):
+         original = MyNet(args("original"))
+         state = original.state_dict()
+--- a/train_bsergb.py
++++ b/train_bsergb.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import csv
+ import os
+ import random
+ from pathlib import Path
+@@ -52,6 +53,7 @@
+     parser.add_argument("--beta", default=0.1, type=float)
+     parser.add_argument("--mask-patch-size", default=32, type=int)
+     parser.add_argument("--basr-mode", choices=("original", "learned"), default="learned")
++    parser.set_defaults(basr_revision=2)
+     parser.add_argument("--repair-ratio", default=0.25, type=float,
+                         help="Fraction of patches selected per image; 0 disables local repair")
+     parser.add_argument("--repair-residual-radius", default=2.0, type=float,
+@@ -59,6 +61,7 @@
+     parser.add_argument("--repair-chunk-size", default=1024, type=int)
+     parser.add_argument("--disable-event-temporal", action="store_true")
+     parser.add_argument("--disable-alignment-candidates", action="store_true")
++    parser.add_argument("--disable-modulation-prior", action="store_true")
+     parser.add_argument("--no-augmentation", action="store_true")
+ 
+     parser.add_argument("--epochs", default=40, type=int)
+@@ -85,6 +88,8 @@
+     parser.add_argument("--lambda-difficulty", default=1.0, type=float)
+     parser.add_argument("--lambda-route", default=0.05, type=float)
+     parser.add_argument("--lambda-gate", default=0.05, type=float)
++    parser.add_argument("--lambda-retrieve", default=0.1, type=float,
++                        help="Direct best-valid-side RGB retrieval objective")
+     parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision")
+     parser.add_argument(
+         "--data-parallel",
+@@ -122,6 +127,7 @@
+     report = load_network_state(model, read_checkpoint(path),
+                                 allow_basr_migration=True, allow_partial=not strict)
+     print(f"Weight loading: migrated={report['migrated']}, "
++          f"revision={report['source_revision']}->{report['target_revision']}, "
+           f"new/missing={len(report['missing'])}, dropped={len(report['dropped'])}, "
+           f"unexpected={report['unexpected']}")
+ 
+@@ -200,11 +206,15 @@
+         "ref": loss_ref,
+         "ps": loss_ps,
+     }
+-    extra = {name: total * 0 for name in ("difficulty", "route", "gate")}
++    extra_names = ("difficulty", "route", "gate", "retrieve", "source_usage", "gate_mean",
++                   "effective_usage", "support_valid", "retrieval_error", "base_error",
++                   "oracle_improvable")
++    extra = {name: total * 0 for name in extra_names}
+     if len(outputs) > 6 and outputs[6]:
+         extra = basr_auxiliary_losses(outputs[6], coarse, gt, args.mask_patch_size)
+         total = (total + args.lambda_difficulty * extra["difficulty"]
+-                 + args.lambda_route * extra["route"] + args.lambda_gate * extra["gate"])
++                 + args.lambda_route * extra["route"] + args.lambda_gate * extra["gate"]
++                 + getattr(args, "lambda_retrieve", 0.1) * extra["retrieve"])
+     losses.update(extra)
+     losses["total"] = total
+     return losses
+@@ -346,11 +356,14 @@
+         f"parameters: {sum(p.numel() for p in model.parameters()):,}"
+     )
+     output_dir = Path(args.output_dir)
++    output_dir.mkdir(parents=True, exist_ok=True)
++    metric_names = ("total", "rec", "syn", "ref", "ps", "difficulty", "route", "gate",
++                    "retrieve", "source_usage", "gate_mean", "effective_usage",
++                    "support_valid", "retrieval_error", "base_error", "oracle_improvable")
+ 
+     for epoch in range(start_epoch, args.epochs):
+         model.train()
+-        running = {name: 0.0 for name in
+-                   ("total", "rec", "syn", "ref", "ps", "difficulty", "route", "gate")}
++        running = {name: 0.0 for name in metric_names}
+         progress = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+         processed_steps = 0
+ 
+@@ -392,6 +405,11 @@
+                     diff=f"{losses['difficulty'].item():.3f}",
+                     route=f"{losses['route'].item():.3f}",
+                     gate=f"{losses['gate'].item():.3f}",
++                    retrieve=f"{losses['retrieve'].item():.3f}",
++                    src=f"{losses['source_usage'].item():.3f}",
++                    gmean=f"{losses['gate_mean'].item():.3f}",
++                    use=f"{losses['effective_usage'].item():.3f}",
++                    valid=f"{losses['support_valid'].item():.3f}",
+                     lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                 )
+ 
+@@ -403,8 +421,20 @@
+             f"rec={means['rec']:.6f}, syn={means['syn']:.6f}, "
+             f"ref={means['ref']:.6f}, ps={means['ps']:.6f}, "
+             f"difficulty={means['difficulty']:.6f}, route={means['route']:.6f}, "
+-            f"gate={means['gate']:.6f}"
++            f"gate={means['gate']:.6f}, retrieve={means['retrieve']:.6f}, "
++            f"source_usage={means['source_usage']:.4f}, gate_mean={means['gate_mean']:.4f}, "
++            f"effective_usage={means['effective_usage']:.4f}, support_valid={means['support_valid']:.4f}, "
++            f"retrieval_error={means['retrieval_error']:.4f}, base_error={means['base_error']:.4f}, "
++            f"oracle_improvable={means['oracle_improvable']:.4f}"
+         )
++        log_path = output_dir / "epoch_metrics.csv"
++        write_header = not log_path.exists() or log_path.stat().st_size == 0
++        with log_path.open("a", newline="", encoding="utf-8") as handle:
++            writer = csv.DictWriter(handle, fieldnames=("epoch", "global_step", "lr", *metric_names))
++            if write_header:
++                writer.writeheader()
++            writer.writerow(dict(epoch=epoch + 1, global_step=global_step,
++                                 lr=optimizer.param_groups[0]["lr"], **means))
+ 
+         save_checkpoint(
+             output_dir,
