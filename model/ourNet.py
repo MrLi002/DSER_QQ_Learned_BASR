@@ -71,23 +71,18 @@ class MyNet(nn.Module):
                            valid_mask=valid_mask,
                            modulation0=alignment0["modulation"] if self.use_modulation and self.use_alignment else [None] * 3,
                            modulation1=alignment1["modulation"] if self.use_modulation and self.use_alignment else [None] * 3)
-            predictions, stages = self.sys(event_feature, frame_feature, ref_feature,
-                                          f_frame0, f_frame1, repair_context=context)
-            corr_list = [torch.nn.functional.adaptive_max_pool2d(selected, f.shape[-2:])
-                         for f in f_frame0]
+            predictions, stages = self.sys(event_feature, frame_feature, ref_feature, f_frame0, f_frame1, repair_context=context)
+            corr_list = [torch.nn.functional.adaptive_max_pool2d(selected, f.shape[-2:]) for f in f_frame0]
             corr_show = selected
-            aux = dict(difficulty=difficulty, patch_scores=patch_scores,
-                       selected=selected, stages=stages)
+            aux = dict(difficulty=difficulty, patch_scores=patch_scores, selected=selected, stages=stages)
         else:
             corr0 = pyramid_patch_mask(img0, Ft, mask, self.mask_patch_size, self.beta)
             corr1 = pyramid_patch_mask(img1, Ft, mask, self.mask_patch_size, self.beta)
             for i in range(3):
                 corr0[i], corr1[i] = mask_reverse(corr0[i], corr1[i])
-            predictions = self.sys(event_feature, frame_feature, ref_feature,
-                                   f_frame0, f_frame1, corr0, corr1)
+            predictions = self.sys(event_feature, frame_feature, ref_feature, f_frame0, f_frame1, corr0, corr1)
             corr_list = [(a + b).clamp(max=1) for a, b in zip(corr0, corr1)]
             corr_show = corr_list[0]
-        result = (pure_rec.repeat(1, 3, 1, 1), rec.repeat(1, 3, 1, 1), Ft,
-                  predictions, corr_show, corr_list)
+        result = (pure_rec.repeat(1, 3, 1, 1), rec.repeat(1, 3, 1, 1), Ft, predictions, corr_show, corr_list)
         return result + (aux,) if return_aux else result
 
